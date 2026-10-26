@@ -5,7 +5,7 @@ import metricRepository from "../repositories/metricRepository.js";
 const PLANNER_MODEL = "gpt-4o-mini";
 // Narrative + advice — bump this one for richer write-ups (e.g. "gpt-4o" or "gpt-4.1").
 const NARRATIVE_MODEL = "gpt-4o-mini";
-const PLANNER_TEMPERATURE = 0.2; // low = reliable date/intent extraction
+const PLANNER_TEMPERATURE = 0.5; // low = reliable date/intent extraction
 const NARRATIVE_TEMPERATURE = 0.7;
 
 const METRICS = [
@@ -30,8 +30,14 @@ const PLANNER_SCHEMA = {
           "Message to show the user for 'chat' or 'clarify'. Empty string when action is 'report'.",
       },
       metric: { type: "string", enum: METRICS },
-      group_by: { type: "string", enum: ["department", "job_grade", "gender", "none"] },
-      chart_type: { type: "string", enum: ["bar", "line", "pie", "kpi_number"] },
+      group_by: {
+        type: "string",
+        enum: ["department", "job_grade", "gender", "none"],
+      },
+      chart_type: {
+        type: "string",
+        enum: ["bar", "line", "pie", "kpi_number"],
+      },
       period_from: { type: "string", description: "YYYY-MM-DD or empty" },
       period_to: { type: "string", description: "YYYY-MM-DD or empty" },
       compare: { type: "boolean" },
@@ -165,7 +171,8 @@ function yr(dateStr) {
 }
 function yearLabel(spec) {
   const y1 = yr(spec.period_from);
-  if (spec.compare && spec.compare_from) return `${y1} vs ${yr(spec.compare_from)}`;
+  if (spec.compare && spec.compare_from)
+    return `${y1} vs ${yr(spec.compare_from)}`;
   return y1;
 }
 function groupLabel(groupBy) {
@@ -195,7 +202,8 @@ const METRIC_META = {
     highlightLowest: true,
     rows: (dim, from, to) => metricRepository.retentionRows(dim, from, to),
     value: (r) => pct(Number(r.retained_count), Number(r.start_count)),
-    overall: (rows) => pct(sumBy(rows, "retained_count"), sumBy(rows, "start_count")),
+    overall: (rows) =>
+      pct(sumBy(rows, "retained_count"), sumBy(rows, "start_count")),
   },
   headcount_growth: {
     name: "Headcount growth",
@@ -225,7 +233,8 @@ const METRIC_META = {
     highlightLowest: false,
     rows: (dim, from, to) => metricRepository.headcountRows(dim, from, to),
     value: (r) => Math.round((Number(r.start_count) + Number(r.end_count)) / 2),
-    overall: (rows) => Math.round((sumBy(rows, "start_count") + sumBy(rows, "end_count")) / 2),
+    overall: (rows) =>
+      Math.round((sumBy(rows, "start_count") + sumBy(rows, "end_count")) / 2),
   },
   leave_utilization: {
     name: "Leave utilization",
@@ -236,7 +245,8 @@ const METRIC_META = {
     highlightLowest: false,
     rows: (dim, from, to) => metricRepository.leaveRows(dim, from, to),
     value: (r) => pct(Number(r.taken_days), Number(r.entitled_days)),
-    overall: (rows) => pct(sumBy(rows, "taken_days"), sumBy(rows, "entitled_days")),
+    overall: (rows) =>
+      pct(sumBy(rows, "taken_days"), sumBy(rows, "entitled_days")),
   },
 };
 
@@ -253,7 +263,11 @@ async function computeMetric(spec) {
   let compareLabel = null;
   const periodLabel = yr(spec.period_from);
   if (spec.compare && spec.compare_from && spec.compare_to) {
-    const rows2 = await meta.rows(spec.group_by, spec.compare_from, spec.compare_to);
+    const rows2 = await meta.rows(
+      spec.group_by,
+      spec.compare_from,
+      spec.compare_to,
+    );
     const map2 = Object.fromEntries(rows2.map((r) => [r.label, meta.value(r)]));
     series = series.map((s) => ({ ...s, compareValue: map2[s.label] ?? 0 }));
     overallCompare = meta.overall(rows2);
@@ -272,7 +286,9 @@ async function computeMetric(spec) {
   const kpi = { label: meta.kpiLabel, value: fmtOverall };
   if (overallCompare != null) {
     const diff = Math.round((overall - overallCompare) * 10) / 10;
-    kpi.trend = meta.isPercent ? `${diff >= 0 ? "+" : ""}${diff} pts` : `${diff >= 0 ? "+" : ""}${diff}`;
+    kpi.trend = meta.isPercent
+      ? `${diff >= 0 ? "+" : ""}${diff} pts`
+      : `${diff >= 0 ? "+" : ""}${diff}`;
   }
 
   // Drivers (turnover only) for a richer narrative
@@ -280,7 +296,9 @@ async function computeMetric(spec) {
     metric: spec.metric,
     grouped_by: spec.group_by,
     period: `${spec.period_from} to ${spec.period_to}`,
-    compare_period: spec.compare ? `${spec.compare_from} to ${spec.compare_to}` : null,
+    compare_period: spec.compare
+      ? `${spec.compare_from} to ${spec.compare_to}`
+      : null,
     overall,
     overall_compare: overallCompare,
     by_group: series.map((s) => ({
@@ -290,7 +308,10 @@ async function computeMetric(spec) {
     })),
   };
   if (meta.drivers) {
-    const d = await metricRepository.leaverDrivers(spec.period_from, spec.period_to);
+    const d = await metricRepository.leaverDrivers(
+      spec.period_from,
+      spec.period_to,
+    );
     facts.leaver_total = Number(d.total_leavers);
     facts.leaver_never_raised = Number(d.never_raised);
     facts.leaver_avg_tenure_months = Number(d.avg_tenure_months);
@@ -358,7 +379,9 @@ const reportService = {
 
     const narrativeCompletion = await callNarrative(spec.metric, result.facts);
     addUsage(usage, narrativeCompletion);
-    const narrative = JSON.parse(narrativeCompletion.choices[0].message.content);
+    const narrative = JSON.parse(
+      narrativeCompletion.choices[0].message.content,
+    );
 
     const report_data = {
       spec,
@@ -375,7 +398,13 @@ const reportService = {
       advice: narrative.advice,
     };
 
-    return { type: "report", content: narrative.narrative, report_data, usage, model: NARRATIVE_MODEL };
+    return {
+      type: "report",
+      content: narrative.narrative,
+      report_data,
+      usage,
+      model: NARRATIVE_MODEL,
+    };
   },
 };
 
