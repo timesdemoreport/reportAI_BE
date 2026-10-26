@@ -90,6 +90,7 @@ Choose an action for each user message:
 - "chat": anything else — greetings, small talk, "what can you do", OR a follow-up question about a report you already produced (e.g. "any other recommended actions?", "why is it high?", "explain that"). Put your answer in "reply".
   - Greetings / capability questions: a short, warm, VARIED reply that invites them to ask for a report.
   - Follow-up questions about the most recent report (given below): answer specifically using that report's data; give additional, DIFFERENT actions or explain the drivers. Never repeat a generic greeting, and do not regenerate the chart.
+  - If the user asks HOW a figure was calculated (e.g. "how did you get 7.1%?"), use the report's "calc" field to show the actual worked arithmetic. Present the equation on its own line as LaTeX wrapped in $$ ... $$ (use calc.latex), then add one short plain-English sentence explaining it. Do not invent numbers — only use the ones in calc.
   - Off-topic: politely say you only help with HR reports.
 
 Rules:
@@ -113,6 +114,7 @@ Rules:
           kpis: ctx.previousReport.kpis,
           series: ctx.previousReport.series,
           spec: ctx.previousReport.spec,
+          calc: ctx.previousReport.calc,
         },
       )}`,
     });
@@ -177,6 +179,60 @@ function yearLabel(spec) {
 }
 function groupLabel(groupBy) {
   return groupBy === "none" ? "company" : groupBy.replace("_", " ");
+}
+
+// Build the worked calculation for the OVERALL figure so follow-ups can explain it.
+function buildCalc(metric, rows, overall) {
+  const n = (k) => sumBy(rows, k);
+  switch (metric) {
+    case "turnover_rate": {
+      const l = n("leavers");
+      const e = n("exposed");
+      return {
+        formula: "turnover = leavers ÷ average headcount × 100",
+        expr: `${l} ÷ ${e} × 100 = ${overall}%`,
+        latex: `\\text{turnover} = \\frac{${l}}{${e}} \\times 100 = ${overall}\\%`,
+      };
+    }
+    case "retention_rate": {
+      const r = n("retained_count");
+      const s = n("start_count");
+      return {
+        formula: "retention = still employed ÷ starting headcount × 100",
+        expr: `${r} ÷ ${s} × 100 = ${overall}%`,
+        latex: `\\text{retention} = \\frac{${r}}{${s}} \\times 100 = ${overall}\\%`,
+      };
+    }
+    case "headcount_growth": {
+      const s = n("start_count");
+      const e = n("end_count");
+      return {
+        formula: "growth = (end − start) ÷ start × 100",
+        expr: `(${e} − ${s}) ÷ ${s} × 100 = ${overall}%`,
+        latex: `\\text{growth} = \\frac{${e} - ${s}}{${s}} \\times 100 = ${overall}\\%`,
+      };
+    }
+    case "average_headcount": {
+      const s = n("start_count");
+      const e = n("end_count");
+      return {
+        formula: "average headcount = (start + end) ÷ 2",
+        expr: `(${s} + ${e}) ÷ 2 = ${overall}`,
+        latex: `\\text{avg headcount} = \\frac{${s} + ${e}}{2} = ${overall}`,
+      };
+    }
+    case "leave_utilization": {
+      const t = n("taken_days");
+      const en = n("entitled_days");
+      return {
+        formula: "leave utilization = days taken ÷ days entitled × 100",
+        expr: `${t} ÷ ${en} × 100 = ${overall}%`,
+        latex: `\\text{leave utilization} = \\frac{${t}}{${en}} \\times 100 = ${overall}\\%`,
+      };
+    }
+    default:
+      return null;
+  }
 }
 
 // ---- metric definitions ----
@@ -276,6 +332,8 @@ async function computeMetric(spec) {
 
   highlight(series, meta.highlightLowest);
 
+  const calc = buildCalc(spec.metric, rows, overall);
+
   // KPI
   const fmtOverall =
     meta.isPercent && spec.metric === "headcount_growth"
@@ -301,6 +359,7 @@ async function computeMetric(spec) {
       : null,
     overall,
     overall_compare: overallCompare,
+    calc,
     by_group: series.map((s) => ({
       label: s.label,
       value: s.value,
@@ -325,6 +384,7 @@ async function computeMetric(spec) {
     title: `${meta.name} by ${groupLabel(spec.group_by)} (${yearLabel(spec)})`,
     period_label: periodLabel,
     compare_label: compareLabel,
+    calc,
     facts,
   };
 }
@@ -391,6 +451,7 @@ const reportService = {
       y_label: result.y_label,
       period_label: result.period_label,
       compare_label: result.compare_label,
+      calc: result.calc,
       series: result.series,
       kpis: result.kpis,
       narrative: narrative.narrative,
