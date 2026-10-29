@@ -2,10 +2,10 @@ import client from "../config/openai.js";
 import metricRepository from "../repositories/metricRepository.js";
 
 // Routing + spec extraction — keep this fast/cheap, mini is plenty.
-const PLANNER_MODEL = "gpt-4o-mini";
+const PLANNER_MODEL = "gpt-4o";
 // Narrative + advice — bump this one for richer write-ups (e.g. "gpt-4o" or "gpt-4.1").
 const NARRATIVE_MODEL = "gpt-4o-mini";
-const PLANNER_TEMPERATURE = 0.5; // low = reliable date/intent extraction
+const PLANNER_TEMPERATURE = 0.2; // low = reliable date/intent extraction // low = reliable date/intent extraction
 const NARRATIVE_TEMPERATURE = 0.7;
 
 const METRICS = [
@@ -23,7 +23,7 @@ const PLANNER_SCHEMA = {
     type: "object",
     additionalProperties: false,
     properties: {
-      action: { type: "string", enum: ["chat", "clarify", "report"] },
+      action: { type: "string", enum: ["chat", "clarify", "report", "simulate"] },
       reply: {
         type: "string",
         description:
@@ -43,6 +43,19 @@ const PLANNER_SCHEMA = {
       compare: { type: "boolean" },
       compare_from: { type: "string", description: "YYYY-MM-DD or empty" },
       compare_to: { type: "string", description: "YYYY-MM-DD or empty" },
+      sim_percent: {
+        type: "string",
+        description: "For action 'simulate': the pay-raise percent as a number string, e.g. '10'. Empty otherwise.",
+      },
+      sim_target: {
+        type: "string",
+        description: "For action 'simulate': the department to raise, e.g. 'Sales'. Empty = whole company.",
+      },
+      years: {
+        type: "array",
+        items: { type: "string" },
+        description: "For comparing 2+ whole years at company level, the year strings e.g. ['2023','2024','2025']. Empty otherwise.",
+      },
     },
     required: [
       "action",
@@ -55,6 +68,9 @@ const PLANNER_SCHEMA = {
       "compare",
       "compare_from",
       "compare_to",
+      "sim_percent",
+      "sim_target",
+      "years",
     ],
   },
 };
@@ -86,6 +102,7 @@ async function callPlanner(question, ctx) {
 
 Choose an action for each user message:
 - "report": the user wants a report and you have enough detail. Fill the spec fields.
+- "simulate": the user asks a WHAT-IF about giving a pay raise and its effect (e.g. "if I give Sales a 10% raise, what happens to turnover?", "what if we raise pay 5%?"). Set action="simulate", sim_target to the department named (or "" for the whole company), sim_percent to the raise percent found in the message as a number string — "a 10% raise" or "raise pay 10%" both give sim_percent="10" — and period to the year in question (default 2025 if unspecified). Only use action="clarify" if the message gives NO percentage at all.
 - "clarify": the user wants a report but a required detail is missing. Ask ONE short, specific question in "reply". Every report needs at least a time period (a year or date range); if it's missing, ask for it. Ask only one question.
 - "chat": anything else — greetings, small talk, "what can you do", OR a follow-up question about a report you already produced (e.g. "any other recommended actions?", "why is it high?", "explain that"). Put your answer in "reply".
   - Greetings / capability questions: a short, warm, VARIED reply that invites them to ask for a report.
@@ -97,10 +114,19 @@ Choose an action for each user message:
 
 Rules:
 - Every "chat" or "clarify" action MUST have a helpful, non-empty "reply". Never return an empty reply.
+- Set sim_percent and sim_target to "" for any action other than "simulate".
 - Formula reference (use for "how is X calculated" questions): turnover = leavers ÷ average headcount × 100; retention = employees still present at period end ÷ employees at period start × 100; headcount growth = (end − start) ÷ start × 100; average headcount = (start + end) ÷ 2; leave utilization = leave days taken ÷ leave days entitled × 100.
 - Dates are YYYY-MM-DD. Treat a bare year (e.g. 2023) as that FULL calendar year: 2023-01-01 to 2023-12-31. Never use a rolling 12-month window unless the user explicitly asks for one.
-- For a comparison like "A vs B" (e.g. "2022 vs 2023"), set period = full calendar year A and compare = full calendar year B, using EXACTLY the two years the user named. Set compare=true. If the user corrects the years ("I mean 2022 vs 2023"), use the corrected years and ignore any earlier ones. Otherwise compare=false and set compare_from/compare_to to "".
-- chart_type options: bar (compare categories), line (trend), pie (share of a whole), kpi_number (single figure). Pick a sensible default, usually bar.
+- Every period covers EXACTLY ONE calendar year: period_from = <year>-01-01 and period_to = the SAME year's -12-31. Never let period_from and period_to fall in different years (same rule for compare_from/compare_to). To cover several years, use the compare fields (2 years) or the "years" array (3+), never a widened single period.
+- For a comparison like "A vs B" (exactly two years, e.g. "2022 vs 2023") broken down by a dimension, set period = full calendar year A and compare = full calendar year B, using EXACTLY the two years named. Set compare=true, years=[]. If the user corrects the years, use the corrected ones. Otherwise compare=false and set compare_from/compare_to to "".
+- "years" is ONLY for THREE OR MORE years at company level (e.g. "compare turnover 2023, 2024 and 2025", "turnover over the last 3 years"): set group_by="none", put ALL named years in "years" (e.g. ["2023","2024","2025"]), set compare=false, set period to the earliest year, and pick chart_type "bar" or "line". For ONE or TWO years, "years" MUST be []: a single year is a normal report, and two years use the compare fields above — never put 1 or 2 years in the "years" array. If the user names THREE OR MORE years (e.g. "2023, 2024 and 2025"), you MUST put every year in the "years" array and set compare=false — do this even if a previous report used a comparison, and never express the years as widened date ranges.
+- Choose chart_type to FIT the question (don't just default to bar):
+   • kpi_number — the user wants a single overall figure with no breakdown ("what's our overall turnover?", "total headcount this year"). Use group_by="none".
+   • pie — a distribution of a COUNT across categories that adds up to a whole ("headcount distribution across departments", "workforce mix by department"). Do NOT use pie for rates/percentages — use bar for those.
+   • bar — comparing a value across categories (by department/grade/gender), or comparing two periods. This is the usual choice for most grouped questions.
+   • line — a trend over time (only meaningful when the data has multiple time points, e.g. a monthly trend).
+   Always respect an explicit request ("show as a pie", "make it a line"). Otherwise infer the best fit from the wording.
+- Metric selection: use average_headcount for questions about how many staff / headcount / workforce size / headcount distribution (it returns the staff count per group). Use headcount_growth only when the user asks about growth or change in headcount.
 - For "chat"/"clarify", still fill spec fields with safe defaults (ignored); keep unknown periods "".
 - If a previous spec is provided and the user is adjusting it ("now 2023 vs 2024", "by gender", "same but retention", "show as a pie chart", "make it a line", "add a comparison to 2024"), apply the change and choose "report". A request like "show it as a pie" only changes chart_type.`;
 
@@ -393,6 +419,135 @@ async function computeMetric(spec) {
   };
 }
 
+// Multi-year: one value per year at company level (keeps chronological order).
+async function computeYears(spec, years) {
+  const meta = METRIC_META[spec.metric];
+  const sorted = [...new Set(years)].sort();
+  const series = [];
+  let lastRows = null;
+  let lastOverall = 0;
+  for (const y of sorted) {
+    const rows = await meta.rows("none", `${y}-01-01`, `${y}-12-31`);
+    const overall = meta.overall(rows);
+    series.push({ label: y, value: overall });
+    lastRows = rows;
+    lastOverall = overall;
+  }
+  if (series.length) {
+    const pick = series.reduce((a, b) =>
+      meta.highlightLowest ? (b.value < a.value ? b : a) : b.value > a.value ? b : a,
+    );
+    pick.highlight = true; // mark the notable year, but DON'T reorder (stay chronological)
+  }
+
+  const earliest = series[0];
+  const latest = series[series.length - 1];
+  const diff = Math.round((latest.value - earliest.value) * 10) / 10;
+  const kpi = {
+    label: `${meta.name} (${latest.label})`,
+    value: meta.isPercent ? `${latest.value}%` : String(latest.value),
+    trend: meta.isPercent
+      ? `${diff >= 0 ? "+" : ""}${diff} pts vs ${earliest.label}`
+      : `${diff >= 0 ? "+" : ""}${diff} vs ${earliest.label}`,
+  };
+
+  return {
+    series,
+    kpis: [kpi],
+    unit: meta.unit,
+    y_label: meta.yLabel,
+    title: `${meta.name} by year (${sorted.join(", ")})`,
+    calc: buildCalc(spec.metric, lastRows, lastOverall),
+    facts: {
+      metric: spec.metric,
+      by_year: series.map((s) => ({ year: s.label, value: s.value })),
+      span: `${earliest.label} to ${latest.label}`,
+    },
+  };
+}
+
+// A pay raise is assumed to retain this share of employees who left without ever getting a raise.
+const RAISE_EFFECTIVENESS = 0.5;
+
+async function callSimNarrative(facts) {
+  const system = `You are an HR analytics assistant presenting a WHAT-IF simulation. Using ONLY the facts provided (never invent numbers):
+- narrative: 2 sentences — state the scenario, the projected turnover change, and the extra annual payroll cost. Make clear this is an estimate based on the stated assumption.
+- prediction: 1 sentence on the likely outcome, phrased as an estimate.
+- advice: 2-3 short, practical next steps (e.g. target the raise at the right group, phase it, monitor results).`;
+
+  return client.chat.completions.create({
+    model: NARRATIVE_MODEL,
+    temperature: NARRATIVE_TEMPERATURE,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(facts) },
+    ],
+    response_format: { type: "json_schema", json_schema: NARRATIVE_SCHEMA },
+  });
+}
+
+async function simulate(spec) {
+  const target = spec.sim_target || "";
+  const inp = await metricRepository.simulationInputs(
+    target,
+    spec.period_from,
+    spec.period_to,
+  );
+  const leavers = Number(inp.leavers);
+  const neverRaisedLeavers = Number(inp.never_raised_leavers);
+  const exposed = Number(inp.exposed);
+  const activeMonthly = Number(inp.active_monthly_salary);
+  const raisePct = Number(spec.sim_percent) || 0;
+
+  const currentTurnover = pct(leavers, exposed);
+  const retained = Math.round(neverRaisedLeavers * RAISE_EFFECTIVENESS);
+  const newLeavers = Math.max(0, leavers - retained);
+  const projectedTurnover = pct(newLeavers, exposed);
+  const annualCost = Math.round((activeMonthly * 12 * raisePct) / 100);
+  const label = target || "company";
+  const diff = Math.round((projectedTurnover - currentTurnover) * 10) / 10;
+
+  const series = [
+    { label: "Current", value: currentTurnover, highlight: true },
+    { label: `After +${raisePct}%`, value: projectedTurnover },
+  ];
+  const kpis = [
+    {
+      label: "Projected turnover",
+      value: `${projectedTurnover}%`,
+      trend: `${diff >= 0 ? "+" : ""}${diff} pts`,
+    },
+    { label: "Extra annual payroll", value: `$${annualCost.toLocaleString()}` },
+  ];
+
+  const facts = {
+    scenario: `a ${raisePct}% pay raise for ${label}`,
+    period: `${spec.period_from} to ${spec.period_to}`,
+    current_turnover_pct: currentTurnover,
+    projected_turnover_pct: projectedTurnover,
+    leavers,
+    never_raised_leavers: neverRaisedLeavers,
+    headcount_exposed: exposed,
+    employees_retained_estimate: retained,
+    extra_annual_payroll_cost: annualCost,
+    assumption: `Assume a raise retains ${Math.round(RAISE_EFFECTIVENESS * 100)}% of the ${neverRaisedLeavers} employees who left without ever receiving a raise. This is an estimate, not a guarantee.`,
+  };
+
+  return {
+    series,
+    kpis,
+    unit: "%",
+    y_label: "Turnover %",
+    title: `What-if: ${raisePct}% raise for ${label} (${yr(spec.period_from)})`,
+    calc: {
+      formula: "extra annual payroll = active monthly salaries × 12 × raise%",
+      expr: `$${activeMonthly.toLocaleString()} × 12 × ${raisePct}% = $${annualCost.toLocaleString()}`,
+      latex: `\\text{extra cost} = ${activeMonthly} \\times 12 \\times ${raisePct}\\% = ${annualCost}`,
+    },
+    facts,
+  };
+}
+
 const reportService = {
   async handleMessage(question, ctx = {}) {
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
@@ -410,6 +565,56 @@ const reportService = {
       };
     }
 
+    if (p.action === "simulate") {
+      if (!p.sim_percent) {
+        return {
+          type: "message",
+          content:
+            "What raise percentage should I simulate? For example, 5% or 10%.",
+          usage,
+          model: PLANNER_MODEL,
+        };
+      }
+      const simSpec = {
+        metric: "turnover_rate",
+        group_by: "none",
+        chart_type: "bar",
+        period_from: p.period_from || "2025-01-01",
+        period_to: p.period_to || "2025-12-31",
+        compare: false,
+        compare_from: "",
+        compare_to: "",
+        sim_percent: p.sim_percent,
+        sim_target: p.sim_target || "",
+      };
+      const sim = await simulate(simSpec);
+      const narrativeCompletion = await callSimNarrative(sim.facts);
+      addUsage(usage, narrativeCompletion);
+      const n = JSON.parse(narrativeCompletion.choices[0].message.content);
+
+      const report_data = {
+        spec: simSpec,
+        chart_type: "bar",
+        unit: sim.unit,
+        title: sim.title,
+        y_label: sim.y_label,
+        badge: "What-if estimate",
+        series: sim.series,
+        kpis: sim.kpis,
+        calc: sim.calc,
+        narrative: n.narrative,
+        prediction: n.prediction,
+        advice: n.advice,
+      };
+      return {
+        type: "report",
+        content: n.narrative,
+        report_data,
+        usage,
+        model: NARRATIVE_MODEL,
+      };
+    }
+
     const spec = {
       metric: p.metric,
       group_by: p.group_by,
@@ -420,6 +625,46 @@ const reportService = {
       compare_from: p.compare_from,
       compare_to: p.compare_to,
     };
+
+    // Safety net: force every period to a single calendar year (Jan 1 – Dec 31).
+    if (spec.period_from) {
+      const y = spec.period_from.slice(0, 4);
+      spec.period_from = `${y}-01-01`;
+      spec.period_to = `${y}-12-31`;
+    }
+    if (spec.compare && spec.compare_from) {
+      const cy = spec.compare_from.slice(0, 4);
+      spec.compare_from = `${cy}-01-01`;
+      spec.compare_to = `${cy}-12-31`;
+    }
+
+    // Multi-year (3+ years) at company level. Two years go through the compare path below.
+    if (p.years && p.years.length >= 3 && METRIC_META[spec.metric]) {
+      const multi = await computeYears(spec, p.years);
+      const narrativeCompletion = await callNarrative(spec.metric, multi.facts);
+      addUsage(usage, narrativeCompletion);
+      const narrative = JSON.parse(narrativeCompletion.choices[0].message.content);
+      const report_data = {
+        spec,
+        chart_type: spec.chart_type || "bar",
+        unit: multi.unit,
+        title: multi.title,
+        y_label: multi.y_label,
+        calc: multi.calc,
+        series: multi.series,
+        kpis: multi.kpis,
+        narrative: narrative.narrative,
+        prediction: narrative.prediction,
+        advice: narrative.advice,
+      };
+      return {
+        type: "report",
+        content: narrative.narrative,
+        report_data,
+        usage,
+        model: NARRATIVE_MODEL,
+      };
+    }
 
     if (!spec.period_from || !spec.period_to) {
       return {
@@ -472,5 +717,14 @@ const reportService = {
     };
   },
 };
+
+// For evaluation: run only the planner (no SQL, no narrative) and report latency + tokens.
+export async function getPlan(question, ctx = {}) {
+  const start = Date.now();
+  const completion = await callPlanner(question, ctx);
+  const latencyMs = Date.now() - start;
+  const plan = JSON.parse(completion.choices[0].message.content);
+  return { plan, latencyMs, usage: completion.usage || {} };
+}
 
 export default reportService;

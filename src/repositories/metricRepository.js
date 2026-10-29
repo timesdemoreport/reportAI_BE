@@ -90,6 +90,21 @@ const metricRepository = {
     return r.rows;
   },
 
+  // Inputs for a pay-raise what-if: leavers, how many never got a raise, headcount, and current payroll.
+  async simulationInputs(target, from, to) {
+    const r = await pool.query(
+      `SELECT
+         count(*) FILTER (WHERE termination_date BETWEEN $2 AND $3) AS leavers,
+         count(*) FILTER (WHERE termination_date BETWEEN $2 AND $3 AND last_salary_change_date = hire_date) AS never_raised_leavers,
+         count(*) FILTER (WHERE hire_date <= $3 AND (termination_date IS NULL OR termination_date >= $2)) AS exposed,
+         COALESCE(sum(monthly_salary) FILTER (WHERE termination_date IS NULL), 0) AS active_monthly_salary
+       FROM employee
+       WHERE ($1 = '' OR department = $1)`,
+      [target || "", from, to],
+    );
+    return r.rows[0];
+  },
+
   // turnover drivers for a grounded narrative
   async leaverDrivers(from, to) {
     const r = await pool.query(
